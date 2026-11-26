@@ -1,5 +1,9 @@
+.git/
+deploy/
+tests/
 bin/
 obj/
+TestResults/
 .vs/
 .vscode/
 *.user
