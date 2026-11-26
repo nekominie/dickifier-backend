@@ -12,6 +12,8 @@ public class User
     [Required]
     [MaxLength(50)]
     public string Username { get; set; } = string.Empty;
+    [Required, MaxLength(50)]
+    public string NormalizedUsername { get; set; } = string.Empty;
 
     [Required]
     public string PasswordHash { get; set; } = string.Empty;
@@ -23,6 +25,7 @@ public class User
 
     [Column(TypeName = "jsonb")]
     public string? WorkspaceDraftJson { get; set; }
+    public int WorkspaceBytes { get; set; }
 
     public DateTime? WorkspaceDraftUpdatedAt { get; set; }
 

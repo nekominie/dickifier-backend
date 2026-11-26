@@ -58,6 +58,7 @@ public class DickModel
     // Geometría 3D completa en JSONB
     [Column(TypeName = "jsonb")]
     public string AnatomyPayload { get; set; } = "{}";
+    public int PayloadBytes { get; set; }
 
     // Social / Metadatos
     public int UpvotesCount { get; set; } = 0;

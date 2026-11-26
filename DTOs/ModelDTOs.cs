@@ -51,7 +51,7 @@ public record ModelSummaryResponse(
     string? CountryCode,
     decimal? HeightCm,
     decimal? WeightKg,
-    JsonElement AnatomyPayload,
+    JsonElement? AnatomyPayload,
     int UpvotesCount,
     int ViewsCount,
     DateTime CreatedAt,

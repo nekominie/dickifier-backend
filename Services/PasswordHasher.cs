@@ -8,13 +8,17 @@ public interface IPasswordHasher
 
 public class PasswordHasher : IPasswordHasher
 {
+    private static readonly SemaphoreSlim Work = new(2,2);
     public string HashPassword(string password)
     {
-        return BCrypt.Net.BCrypt.EnhancedHashPassword(password, workFactor: 11);
+        if (!Work.Wait(0)) throw new Security.ResourceLimitException("Servidor ocupado.",1);
+        try { return BCrypt.Net.BCrypt.EnhancedHashPassword(password, workFactor: 11); }
+        finally { Work.Release(); }
     }
 
     public bool VerifyPassword(string password, string passwordHash)
     {
+        if (!Work.Wait(0)) throw new Security.ResourceLimitException("Servidor ocupado.",1);
         try
         {
             return BCrypt.Net.BCrypt.EnhancedVerify(password, passwordHash);
@@ -23,5 +27,6 @@ public class PasswordHasher : IPasswordHasher
         {
             return false;
         }
+        finally { Work.Release(); }
     }
 }

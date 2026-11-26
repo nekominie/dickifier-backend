@@ -8,25 +8,16 @@ public static class ShortCodeGenerator
     private const string Alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     public const string Prefix = "DK-";
 
-    public static string Generate(int length = 4)
+    public static string Generate(int length = 6)
     {
-        var chars = new char[length];
-        var bytes = new byte[length];
-        RandomNumberGenerator.Fill(bytes);
-
-        for (int i = 0; i < length; i++)
-        {
-            chars[i] = Alphabet[bytes[i] % Alphabet.Length];
-        }
-
-        return $"{Prefix}{new string(chars)}";
+        return $"{Prefix}{RandomNumberGenerator.GetString(Alphabet,length)}";
     }
 
     public static string Normalize(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return string.Empty;
         var clean = input.Trim().ToUpperInvariant();
-        if (!clean.StartsWith(Prefix) && clean.Length <= 5)
+        if (!clean.StartsWith(Prefix) && clean.Length <= 9)
         {
             return $"{Prefix}{clean}";
         }

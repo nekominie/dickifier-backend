@@ -1,524 +1,205 @@
 using System.Security.Claims;
-using System.Text.Json;
+using System.Text;
+using System.Text.RegularExpressions;
 using backend_dickifier.Data;
 using backend_dickifier.DTOs;
 using backend_dickifier.Entities;
+using backend_dickifier.Security;
+using backend_dickifier.Services;
 using backend_dickifier.Utils;
 using backend_dickifier.Validators;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace backend_dickifier.Controllers;
 
-[ApiController]
-[Route("api/[controller]")]
-[Route("api/dickifier/[controller]")]
-public class ModelsController : ControllerBase
+[ApiController, Route("api/models"), Route("api/dickifier/models")]
+public sealed class ModelsController(DickifierDbContext db, SecurityOptions settings, ResourceQuota quota,
+    PayloadValidator payloads, VisitRegistry visits) : ControllerBase
 {
-    private readonly DickifierDbContext _dbContext;
-
-    public ModelsController(DickifierDbContext dbContext)
-    {
-        _dbContext = dbContext;
-    }
-
-    /// <summary>
-    /// Lista pública paginada con filtros y ordenamiento del Repositorio Global.
-    /// </summary>
     [HttpGet]
-    [ProducesResponseType(typeof(PagedResult<ModelSummaryResponse>), StatusCodes.Status200OK)]
-    public async Task<IActionResult> GetModels(
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 20,
-        [FromQuery] string filter = "all",
-        [FromQuery] string sortBy = "recent",
-        [FromQuery] string? country = null,
-        [FromQuery] string? search = null)
+    public async Task<IActionResult> GetModels([FromQuery] int page = 1, [FromQuery] int pageSize = 20,
+        [FromQuery] string filter = "all", [FromQuery] string sortBy = "recent",
+        [FromQuery] string? country = null, [FromQuery] string? search = null, CancellationToken ct = default)
     {
-        page = Math.Max(1, page);
-        pageSize = Math.Clamp(pageSize, 1, 100);
-
-        var query = _dbContext.Models
-            .Include(m => m.User)
-            .Where(m => m.Status != "flagged")
-            .AsNoTracking();
-
-        // Búsqueda por nombre o código único (ShortCode)
+        if (page is < 1 or > 1000 || pageSize is < 1 or > 50 || search?.Length > 80 || country?.Length > 2
+            || filter is not ("all" or "registered" or "anonymous")
+            || sortBy is not ("recent" or "votes" or "length" or "girth" or "volume"))
+            return BadRequest(new { message = "Filtros o paginación inválidos." });
+        var query = db.Models.AsNoTracking().Where(m => m.Status != "flagged");
         if (!string.IsNullOrWhiteSpace(search))
         {
-            var s = search.Trim();
-            var normalizedCode = s.ToUpperInvariant();
-            query = query.Where(m => EF.Functions.ILike(m.Name, $"%{s}%") || m.ShortCode.Contains(normalizedCode));
+            var text = search.Trim().Replace("\\","\\\\").Replace("%","\\%").Replace("_","\\_");
+            if (text.Length < 2) return BadRequest(new { message = "La búsqueda requiere al menos dos caracteres." });
+            var pattern = $"%{text}%";
+            var code = ShortCodeGenerator.Normalize(search);
+            query = query.Where(m => EF.Functions.ILike(m.Name,pattern,"\\") || m.ShortCode.StartsWith(code));
         }
-
-        // Filtro por tipo de cuenta
-        if (string.Equals(filter, "registered", StringComparison.OrdinalIgnoreCase))
+        if (filter != "all") query = query.Where(m => m.Status == filter);
+        if (!string.IsNullOrEmpty(country))
         {
-            query = query.Where(m => m.Status == "registered");
+            if (!Regex.IsMatch(country,"^[a-zA-Z]{2}$")) return BadRequest();
+            var code = country.ToUpperInvariant(); query = query.Where(m => m.CountryCode == code);
         }
-        else if (string.Equals(filter, "anonymous", StringComparison.OrdinalIgnoreCase))
+        query = sortBy switch
         {
-            query = query.Where(m => m.Status == "anonymous");
-        }
-
-        // Filtro por país
-        if (!string.IsNullOrWhiteSpace(country))
-        {
-            var c = country.Trim().ToUpperInvariant();
-            query = query.Where(m => m.CountryCode == c);
-        }
-
-        // Ordenamiento
-        query = sortBy.ToLowerInvariant() switch
-        {
-            "votes" => query.OrderByDescending(m => m.UpvotesCount).ThenByDescending(m => m.CreatedAt),
-            "length" => query.OrderByDescending(m => m.LengthCm).ThenByDescending(m => m.CreatedAt),
-            "girth" => query.OrderByDescending(m => m.GirthCm).ThenByDescending(m => m.CreatedAt),
-            "volume" => query.OrderByDescending(m => m.VolumeCm3).ThenByDescending(m => m.CreatedAt),
-            _ => query.OrderByDescending(m => m.CreatedAt) // "recent" por defecto
+            "votes" => query.OrderByDescending(m => m.UpvotesCount).ThenBy(m => m.Id),
+            "length" => query.OrderByDescending(m => m.LengthCm).ThenBy(m => m.Id),
+            "girth" => query.OrderByDescending(m => m.GirthCm).ThenBy(m => m.Id),
+            "volume" => query.OrderByDescending(m => m.VolumeCm3).ThenBy(m => m.Id),
+            _ => query.OrderByDescending(m => m.CreatedAt).ThenBy(m => m.Id)
         };
-
-        var total = await query.CountAsync();
-        var totalPages = (int)Math.Ceiling(total / (double)pageSize);
-
-        var rawItems = await query
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .Select(m => new {
-                m.Id,
-                m.ShortCode,
-                m.Name,
-                m.Status,
-                m.UserId,
-                AuthorUsername = m.User != null ? m.User.Username : null,
-                m.LengthCm,
-                m.GirthCm,
-                m.VolumeCm3,
-                m.CurvatureDirection,
-                m.CurvatureDegrees,
-                m.CountryCode,
-                m.HeightCm,
-                m.WeightKg,
-                m.UpvotesCount,
-                m.ViewsCount,
-                m.CreatedAt,
-                m.UpdatedAt,
-                m.AnatomyPayload
-            })
-            .ToListAsync();
-
-        var items = rawItems.Select(m => {
-            JsonElement anatomyElement;
-            try {
-                anatomyElement = JsonDocument.Parse(string.IsNullOrWhiteSpace(m.AnatomyPayload) ? "{}" : m.AnatomyPayload).RootElement.Clone();
-            } catch {
-                anatomyElement = JsonDocument.Parse("{}").RootElement.Clone();
-            }
-            return new ModelSummaryResponse(
-                m.Id,
-                m.ShortCode,
-                m.Name,
-                m.Status,
-                m.UserId,
-                m.AuthorUsername,
-                m.LengthCm,
-                m.GirthCm,
-                m.VolumeCm3,
-                m.CurvatureDirection,
-                m.CurvatureDegrees,
-                m.CountryCode,
-                m.HeightCm,
-                m.WeightKg,
-                anatomyElement,
-                m.UpvotesCount,
-                m.ViewsCount,
-                m.CreatedAt,
-                m.UpdatedAt
-            );
-        }).ToList();
-
-        return Ok(new PagedResult<ModelSummaryResponse>(items, total, page, pageSize, totalPages));
+        return Ok(await ModelQueries.Page(query,page,pageSize,ct));
     }
 
-    /// <summary>
-    /// Obtiene un modelo completo por su ID (Guid) o Código Corto (ej. DK-8X2K)
-    /// con su payload anatómico JSONB para Three.js. Incrementa las visitas.
-    /// </summary>
     [HttpGet("{idOrCode}")]
-    [ProducesResponseType(typeof(ModelDetailResponse), StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> GetModelById(string idOrCode)
+    public async Task<IActionResult> GetModelById(string idOrCode, CancellationToken ct)
     {
-        DickModel? model;
-        if (Guid.TryParse(idOrCode, out var guidId))
-        {
-            model = await _dbContext.Models
-                .Include(m => m.User)
-                .FirstOrDefaultAsync(m => m.Id == guidId && m.Status != "flagged");
-        }
-        else
-        {
-            var normalizedCode = ShortCodeGenerator.Normalize(idOrCode);
-            model = await _dbContext.Models
-                .Include(m => m.User)
-                .FirstOrDefaultAsync(m => m.ShortCode == normalizedCode && m.Status != "flagged");
-        }
-
-        if (model == null)
-        {
-            return NotFound(new { message = "El modelo solicitado no existe o fue retirado." });
-        }
-
-        // Incrementar visitas de forma segura
-        model.ViewsCount++;
-        await _dbContext.SaveChangesAsync();
-
-        JsonElement anatomyElement;
-        try
-        {
-            anatomyElement = JsonDocument.Parse(string.IsNullOrWhiteSpace(model.AnatomyPayload) ? "{}" : model.AnatomyPayload).RootElement.Clone();
-        }
-        catch
-        {
-            anatomyElement = JsonDocument.Parse("{}").RootElement.Clone();
-        }
-
-        var response = new ModelDetailResponse(
-            model.Id,
-            model.ShortCode,
-            model.Name,
-            model.Status,
-            model.UserId,
-            model.User?.Username,
-            model.LengthCm,
-            model.GirthCm,
-            model.VolumeCm3,
-            model.CurvatureDirection,
-            model.CurvatureDegrees,
-            model.CountryCode,
-            model.HeightCm,
-            model.WeightKg,
-            anatomyElement,
-            model.UpvotesCount,
-            model.ViewsCount,
-            model.CreatedAt,
-            model.UpdatedAt
-        );
-
-        return Ok(response);
+        if (idOrCode.Length > 40) return NotFound();
+        var query = db.Models.AsNoTracking().Where(m => m.Status != "flagged");
+        query = Guid.TryParse(idOrCode,out var id) ? query.Where(m => m.Id == id)
+            : query.Where(m => m.ShortCode == ShortCodeGenerator.Normalize(idOrCode));
+        var size = await query.Select(m => (int?)m.PayloadBytes).SingleOrDefaultAsync(ct);
+        if (size > SecurityOptions.MaxPayloadBytes) return StatusCode(413,new { message = "Este payload antiguo supera el límite de lectura.", code = "payload_too_large" });
+        var model = await query.Include(m => m.User).SingleOrDefaultAsync(ct);
+        return model is null ? NotFound() : Ok(ModelQueries.Detail(model));
     }
 
-    /// <summary>
-    /// Publica un nuevo modelo en el Repositorio Global.
-    /// Si está autenticado, se asocia a su usuario. Si es anónimo, devuelve un editToken.
-    /// </summary>
-    [HttpPost]
-    [ProducesResponseType(typeof(CreateModelResponse), StatusCodes.Status201Created)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public async Task<IActionResult> CreateModel([FromBody] CreateModelRequest request)
+    [HttpPost, EnableRateLimiting("write")]
+    public async Task<IActionResult> CreateModel(CreateModelRequest request, CancellationToken ct)
     {
-        // Validación de plausibilidad biológica y anti-trolls
-        var validation = PlausibilityValidator.Validate(
-            request.LengthCm,
-            request.GirthCm,
-            request.CurvatureDirection,
-            request.CurvatureDegrees,
-            request.Name,
-            request.HeightCm,
-            request.WeightKg,
-            request.CountryCode
-        );
-
-        if (!validation.IsValid)
+        var user = UserId();
+        if ((Request.Headers.Authorization.Count > 0 && user is null) || (user is null && !settings.AnonymousPublishingEnabled))
+            return Unauthorized(new { message = "Inicia sesión para publicar un modelo.", code = "authentication_required" });
+        var validation = PlausibilityValidator.Validate(request.LengthCm,request.GirthCm,request.CurvatureDirection,
+            request.CurvatureDegrees,request.Name,request.HeightCm,request.WeightKg,request.CountryCode);
+        if (!validation.IsValid) return BadRequest(new { message = validation.ErrorMessage });
+        if (!payloads.TryValidate(request.AnatomyPayload,false,out var json,out var error)) return BadRequest(new { message = error, code = "invalid_payload" });
+        var bytes = Encoding.UTF8.GetByteCount(json);
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        await quota.Charge(quota.Day($"models-ip:{quota.Client(HttpContext)}"),1,0,user is null ? settings.AnonymousModelsPerIpPerDay : settings.ModelsPerIpPerDay,0,true,ct);
+        if (user.HasValue)
         {
-            return BadRequest(new { message = validation.ErrorMessage });
+            await quota.Charge(quota.Day($"models-user:{user}"),1,0,settings.ModelsPerUserPerDay,0,true,ct);
         }
-
-        // Cálculo volumétrico cilíndrico aproximado V = (girth^2 * length) / (4 * pi)
-        var volumeCm3 = Math.Round((decimal)(Math.Pow((double)request.GirthCm, 2) * (double)request.LengthCm / (4 * Math.PI)), 1);
-
-        Guid? userId = null;
-        string? editToken = null;
-        string? editTokenHash = null;
-        string status;
-
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (User.Identity?.IsAuthenticated == true && Guid.TryParse(userIdClaim, out var parsedUserId))
-        {
-            userId = parsedUserId;
-            status = "registered";
-        }
-        else
-        {
-            status = "anonymous";
-            editToken = TokenUtils.GenerateSecureToken(32);
-            editTokenHash = TokenUtils.ComputeSha256Hash(editToken);
-        }
-
-        string anatomyJson = "{}";
-        if (request.AnatomyPayload.HasValue && request.AnatomyPayload.Value.ValueKind != JsonValueKind.Null && request.AnatomyPayload.Value.ValueKind != JsonValueKind.Undefined)
-        {
-            anatomyJson = request.AnatomyPayload.Value.GetRawText();
-        }
-
-        // Generación de ID Corto único permanente (DK-XXXX)
-        string shortCode;
-        do
-        {
-            shortCode = ShortCodeGenerator.Generate();
-        } while (await _dbContext.Models.AnyAsync(m => m.ShortCode == shortCode));
-
+        await ChargeStorage(user,1,bytes,ct);
+        var edit = user is null ? TokenUtils.GenerateSecureToken() : null;
         var model = new DickModel
         {
-            Id = Guid.NewGuid(),
-            ShortCode = shortCode,
-            UserId = userId,
-            EditTokenHash = editTokenHash,
-            Name = request.Name.Trim(),
-            Status = status,
-            LengthCm = Math.Round(request.LengthCm, 1),
-            GirthCm = Math.Round(request.GirthCm, 1),
-            VolumeCm3 = volumeCm3,
-            CurvatureDirection = request.CurvatureDirection.ToLowerInvariant(),
-            CurvatureDegrees = request.CurvatureDegrees,
-            CountryCode = string.IsNullOrWhiteSpace(request.CountryCode) ? null : request.CountryCode.Trim().ToUpperInvariant(),
-            HeightCm = request.HeightCm.HasValue ? Math.Round(request.HeightCm.Value, 1) : null,
-            WeightKg = request.WeightKg.HasValue ? Math.Round(request.WeightKg.Value, 1) : null,
-            AnatomyPayload = anatomyJson,
-            UpvotesCount = 0,
-            ViewsCount = 0,
-            CreatedAt = DateTime.UtcNow,
-            UpdatedAt = DateTime.UtcNow
+            UserId = user, EditTokenHash = edit is null ? null : TokenUtils.ComputeSha256Hash(edit),
+            Status = user.HasValue ? "registered" : "anonymous", Name = request.Name.Trim(),
+            LengthCm = Math.Round(request.LengthCm,1), GirthCm = Math.Round(request.GirthCm,1),
+            VolumeCm3 = Volume(request.LengthCm,request.GirthCm), CurvatureDirection = request.CurvatureDirection.ToLowerInvariant(),
+            CurvatureDegrees = request.CurvatureDegrees, HeightCm = request.HeightCm, WeightKg = request.WeightKg,
+            CountryCode = request.CountryCode?.ToUpperInvariant(), AnatomyPayload = json, PayloadBytes = bytes
         };
-
-        _dbContext.Models.Add(model);
-        await _dbContext.SaveChangesAsync();
-
-        var response = new CreateModelResponse(
-            model.Id,
-            model.ShortCode,
-            model.Name,
-            model.Status,
-            model.UserId,
-            model.LengthCm,
-            model.GirthCm,
-            model.VolumeCm3,
-            editToken, // Devuelto solo aquí para que el autor anónimo lo guarde
-            model.CreatedAt
-        );
-
-        return CreatedAtAction(nameof(GetModelById), new { idOrCode = model.ShortCode }, response);
+        db.Models.Add(model);
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            model.ShortCode = ShortCodeGenerator.Generate();
+            try { await db.SaveChangesAsync(ct); break; }
+            catch (DbUpdateException ex) when (attempt < 2 && ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "IX_dick_models_ShortCode" }) { }
+        }
+        await transaction.CommitAsync(ct);
+        return CreatedAtAction(nameof(GetModelById),new { idOrCode = model.ShortCode },
+            new CreateModelResponse(model.Id,model.ShortCode,model.Name,model.Status,user,model.LengthCm,model.GirthCm,model.VolumeCm3,edit,model.CreatedAt));
     }
 
-    /// <summary>
-    /// Actualiza un modelo existente. Requiere ser el usuario dueño o proveer el editToken.
-    /// </summary>
-    [HttpPut("{id:guid}")]
-    [ProducesResponseType(typeof(ModelDetailResponse), StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> UpdateModel(
-        Guid id,
-        [FromBody] UpdateModelRequest request,
-        [FromHeader(Name = "X-Edit-Token")] string? headerEditToken)
+    [HttpPut("{id:guid}"), EnableRateLimiting("write")]
+    public async Task<IActionResult> UpdateModel(Guid id, UpdateModelRequest request, CancellationToken ct)
     {
-        var model = await _dbContext.Models
-            .Include(m => m.User)
-            .FirstOrDefaultAsync(m => m.Id == id);
-
-        if (model == null)
+        if (Request.Query.ContainsKey("editToken")) return BadRequest(new { message = "Usa X-Edit-Token, no la URL." });
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        var model = await LockedModel(id,ct);
+        if (model is null) return NotFound();
+        if (!CanModify(model)) return StatusCode(403,new { message = "No tienes permiso para modificar este modelo." });
+        if (model.PayloadBytes > SecurityOptions.MaxPayloadBytes && !request.AnatomyPayload.HasValue)
+            return BadRequest(new { message = "Sustituye el payload antiguo por uno dentro del límite." });
+        var validation = PlausibilityValidator.Validate(request.LengthCm ?? model.LengthCm,request.GirthCm ?? model.GirthCm,
+            request.CurvatureDirection ?? model.CurvatureDirection,request.CurvatureDegrees ?? model.CurvatureDegrees,
+            request.Name ?? model.Name,request.HeightCm ?? model.HeightCm,request.WeightKg ?? model.WeightKg,request.CountryCode ?? model.CountryCode);
+        if (!validation.IsValid) return BadRequest(new { message = validation.ErrorMessage });
+        if (request.AnatomyPayload.HasValue)
         {
-            return NotFound(new { message = "El modelo no existe." });
+            if (!payloads.TryValidate(request.AnatomyPayload,false,out var json,out var error)) return BadRequest(new { message = error, code = "invalid_payload" });
+            var bytes = Encoding.UTF8.GetByteCount(json);
+            await ChargeStorage(model.UserId,0,bytes-model.PayloadBytes,ct);
+            model.AnatomyPayload = json; model.PayloadBytes = bytes;
         }
-
-        // Verificación de autorización
-        if (!IsAuthorizedToModify(model, headerEditToken ?? request.EditToken))
-        {
-            return StatusCode(StatusCodes.Status403Forbidden, new { message = "No tienes permiso para modificar este modelo. Se requiere ser el usuario propietario o proveer el token de edición válido." });
-        }
-
-        var newLength = request.LengthCm ?? model.LengthCm;
-        var newGirth = request.GirthCm ?? model.GirthCm;
-        var newDirection = request.CurvatureDirection ?? model.CurvatureDirection;
-        var newDegrees = request.CurvatureDegrees ?? model.CurvatureDegrees;
-        var newName = request.Name ?? model.Name;
-        var newHeight = request.HeightCm ?? model.HeightCm;
-        var newWeight = request.WeightKg ?? model.WeightKg;
-        var newCountry = request.CountryCode ?? model.CountryCode;
-
-        var validation = PlausibilityValidator.Validate(
-            newLength,
-            newGirth,
-            newDirection,
-            newDegrees,
-            newName,
-            newHeight,
-            newWeight,
-            newCountry
-        );
-
-        if (!validation.IsValid)
-        {
-            return BadRequest(new { message = validation.ErrorMessage });
-        }
-
-        model.Name = newName.Trim();
-        model.LengthCm = Math.Round(newLength, 1);
-        model.GirthCm = Math.Round(newGirth, 1);
-        model.VolumeCm3 = Math.Round((decimal)(Math.Pow((double)model.GirthCm, 2) * (double)model.LengthCm / (4 * Math.PI)), 1);
-        model.CurvatureDirection = newDirection.ToLowerInvariant();
-        model.CurvatureDegrees = newDegrees;
-        model.CountryCode = string.IsNullOrWhiteSpace(newCountry) ? null : newCountry.Trim().ToUpperInvariant();
-        model.HeightCm = newHeight.HasValue ? Math.Round(newHeight.Value, 1) : null;
-        model.WeightKg = newWeight.HasValue ? Math.Round(newWeight.Value, 1) : null;
-
-        if (request.AnatomyPayload.HasValue && request.AnatomyPayload.Value.ValueKind != JsonValueKind.Null && request.AnatomyPayload.Value.ValueKind != JsonValueKind.Undefined)
-        {
-            model.AnatomyPayload = request.AnatomyPayload.Value.GetRawText();
-        }
-
+        model.Name = request.Name?.Trim() ?? model.Name;
+        model.LengthCm = request.LengthCm ?? model.LengthCm; model.GirthCm = request.GirthCm ?? model.GirthCm;
+        model.VolumeCm3 = Volume(model.LengthCm,model.GirthCm);
+        model.CurvatureDirection = request.CurvatureDirection?.ToLowerInvariant() ?? model.CurvatureDirection;
+        model.CurvatureDegrees = request.CurvatureDegrees ?? model.CurvatureDegrees;
+        model.CountryCode = request.CountryCode?.ToUpperInvariant() ?? model.CountryCode;
+        model.HeightCm = request.HeightCm ?? model.HeightCm; model.WeightKg = request.WeightKg ?? model.WeightKg;
         model.UpdatedAt = DateTime.UtcNow;
-
-        await _dbContext.SaveChangesAsync();
-
-        JsonElement anatomyElement;
-        try
-        {
-            anatomyElement = JsonDocument.Parse(model.AnatomyPayload).RootElement.Clone();
-        }
-        catch
-        {
-            anatomyElement = JsonDocument.Parse("{}").RootElement.Clone();
-        }
-
-        return Ok(new ModelDetailResponse(
-            model.Id,
-            model.ShortCode,
-            model.Name,
-            model.Status,
-            model.UserId,
-            model.User?.Username,
-            model.LengthCm,
-            model.GirthCm,
-            model.VolumeCm3,
-            model.CurvatureDirection,
-            model.CurvatureDegrees,
-            model.CountryCode,
-            model.HeightCm,
-            model.WeightKg,
-            anatomyElement,
-            model.UpvotesCount,
-            model.ViewsCount,
-            model.CreatedAt,
-            model.UpdatedAt
-        ));
+        await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
+        model.AnatomyPayload = await db.Models.AsNoTracking().Where(m => m.Id == id).Select(m => m.AnatomyPayload).SingleAsync(ct);
+        await db.Entry(model).Reference(m => m.User).LoadAsync(ct);
+        return Ok(ModelQueries.Detail(model));
     }
 
-    /// <summary>
-    /// Elimina un modelo. Requiere ser el usuario dueño o proveer el editToken.
-    /// </summary>
-    [HttpDelete("{id:guid}")]
-    [ProducesResponseType(StatusCodes.Status204NoContent)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> DeleteModel(
-        Guid id,
-        [FromHeader(Name = "X-Edit-Token")] string? headerEditToken,
-        [FromQuery] string? editToken)
+    [HttpDelete("{id:guid}"), EnableRateLimiting("write")]
+    public async Task<IActionResult> DeleteModel(Guid id, CancellationToken ct)
     {
-        var model = await _dbContext.Models.FirstOrDefaultAsync(m => m.Id == id);
-        if (model == null)
-        {
-            return NotFound(new { message = "El modelo no existe." });
-        }
-
-        if (!IsAuthorizedToModify(model, headerEditToken ?? editToken))
-        {
-            return StatusCode(StatusCodes.Status403Forbidden, new { message = "No tienes permiso para eliminar este modelo." });
-        }
-
-        _dbContext.Models.Remove(model);
-        await _dbContext.SaveChangesAsync();
-
+        if (Request.Query.ContainsKey("editToken")) return BadRequest(new { message = "Usa X-Edit-Token, no la URL." });
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        var model = await LockedModel(id,ct);
+        if (model is null) return NotFound();
+        if (!CanModify(model)) return StatusCode(403,new { message = "No tienes permiso para eliminar este modelo." });
+        await ChargeStorage(model.UserId,-1,-model.PayloadBytes,ct);
+        db.Models.Remove(model); await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
         return NoContent();
     }
 
-    /// <summary>
-    /// Incrementa los votos de un modelo si no ha votado antes desde la misma sesión o usuario.
-    /// </summary>
-    [HttpPost("{id:guid}/vote")]
-    [ProducesResponseType(typeof(VoteResponse), StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> Vote(
-        Guid id,
-        [FromHeader(Name = "X-Voter-Fingerprint")] string? clientFingerprint)
+    [HttpPost("{id:guid}/vote"), EnableRateLimiting("write")]
+    public async Task<IActionResult> Vote(Guid id, CancellationToken ct)
     {
-        var model = await _dbContext.Models.FirstOrDefaultAsync(m => m.Id == id && m.Status != "flagged");
-        if (model == null)
-        {
-            return NotFound(new { message = "El modelo no existe." });
-        }
-
-        string rawFingerprint;
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (User.Identity?.IsAuthenticated == true && Guid.TryParse(userIdClaim, out var userId))
-        {
-            rawFingerprint = $"user:{userId}";
-        }
-        else
-        {
-            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown_ip";
-            rawFingerprint = $"anon:{clientFingerprint ?? "nofp"}:{ip}";
-        }
-
-        var fingerprintHash = TokenUtils.ComputeSha256Hash(rawFingerprint);
-
-        var alreadyVoted = await _dbContext.ModelVotes
-            .AnyAsync(v => v.ModelId == id && v.VoterFingerprintHash == fingerprintHash);
-
-        if (alreadyVoted)
-        {
-            return Ok(new VoteResponse(true, model.UpvotesCount, "Ya has votado por este modelo anteriormente."));
-        }
-
-        var vote = new ModelVote
-        {
-            Id = Guid.NewGuid(),
-            ModelId = id,
-            VoterFingerprintHash = fingerprintHash,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        _dbContext.ModelVotes.Add(vote);
-        model.UpvotesCount++;
-        await _dbContext.SaveChangesAsync();
-
-        return Ok(new VoteResponse(true, model.UpvotesCount));
+        var user = UserId();
+        if (Request.Headers.Authorization.Count > 0 && user is null) return Unauthorized();
+        if (!await db.Models.AnyAsync(m => m.Id == id && m.Status != "flagged",ct)) return NotFound();
+        // La huella indicada por el cliente se ignora; no permite multiplicar votos.
+        var identity = quota.Fingerprint(user.HasValue ? $"user:{user}" : $"ip:{quota.Client(HttpContext)}");
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        var voteId = Guid.NewGuid(); var now = DateTime.UtcNow;
+        var inserted = await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO model_votes ("Id","ModelId","VoterFingerprintHash","CreatedAt")
+            SELECT {voteId},{id},{identity},{now}
+            WHERE EXISTS (SELECT 1 FROM dick_models WHERE "Id"={id} AND "Status"<>'flagged')
+            ON CONFLICT ("ModelId","VoterFingerprintHash") DO NOTHING
+            """,ct);
+        if (inserted > 0) await db.Models.Where(m => m.Id == id).ExecuteUpdateAsync(update => update.SetProperty(m => m.UpvotesCount,m => m.UpvotesCount+1),ct);
+        var count = await db.Models.Where(m => m.Id == id).Select(m => m.UpvotesCount).SingleOrDefaultAsync(ct);
+        await transaction.CommitAsync(ct);
+        return Ok(new VoteResponse(true,count,inserted == 0 ? "Ya has votado por este modelo." : null));
     }
 
-    private bool IsAuthorizedToModify(DickModel model, string? token)
+    [HttpPost("{id:guid}/view"), EnableRateLimiting("write")]
+    public async Task<IActionResult> View(Guid id, CancellationToken ct)
     {
-        // 1. Si el usuario actual es el dueño registrado (vía JWT)
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (User.Identity?.IsAuthenticated == true &&
-            Guid.TryParse(userIdClaim, out var currentUserId) &&
-            model.UserId.HasValue &&
-            model.UserId.Value == currentUserId)
-        {
-            return true;
-        }
-
-        // 2. Si se suministró un token de edición que coincida con el hash almacenado
-        if (!string.IsNullOrWhiteSpace(token) && !string.IsNullOrWhiteSpace(model.EditTokenHash))
-        {
-            var hash = TokenUtils.ComputeSha256Hash(token.Trim());
-            if (string.Equals(hash, model.EditTokenHash, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        if (visits.TryRecord($"{id}:{quota.Client(HttpContext)}"))
+            if (await db.Models.Where(m => m.Id == id && m.Status != "flagged")
+                .ExecuteUpdateAsync(update => update.SetProperty(m => m.ViewsCount,m => m.ViewsCount+1),ct) == 0) return NotFound();
+        return NoContent();
     }
+
+    private Guid? UserId() => User.Identity?.IsAuthenticated == true && Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier),out var id) ? id : null;
+    private bool CanModify(DickModel model) => (model.UserId.HasValue && model.UserId == UserId())
+        || TokenUtils.Matches(Request.Headers["X-Edit-Token"].FirstOrDefault(),model.EditTokenHash);
+    private Task<DickModel?> LockedModel(Guid id, CancellationToken ct) =>
+        db.Models.FromSqlInterpolated($$"""
+            SELECT "Id","ShortCode","UserId","EditTokenHash","Name","Status","LengthCm","GirthCm","VolumeCm3",
+              "CurvatureDirection","CurvatureDegrees","CountryCode","HeightCm","WeightKg","PayloadBytes",
+              "UpvotesCount","ViewsCount","CreatedAt","UpdatedAt",'{}'::jsonb AS "AnatomyPayload"
+            FROM dick_models WHERE "Id"={{id}} FOR UPDATE
+            """).SingleOrDefaultAsync(ct);
+    private async Task ChargeStorage(Guid? user, int count, long bytes, CancellationToken ct)
+    {
+        await quota.Charge("models:global",count,bytes,settings.MaximumModels,settings.MaximumStoredBytes,false,ct);
+        if (user.HasValue) await quota.Charge($"storage-user:{user}",count,bytes,settings.ModelsPerUser,settings.MaximumUserBytes,false,ct);
+    }
+    private static decimal Volume(decimal length, decimal girth) => Math.Round((decimal)(Math.Pow((double)girth,2)*(double)length/(4*Math.PI)),1);
 }

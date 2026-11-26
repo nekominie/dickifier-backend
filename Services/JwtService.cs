@@ -2,58 +2,33 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using backend_dickifier.Entities;
+using backend_dickifier.Security;
 using Microsoft.IdentityModel.Tokens;
 
 namespace backend_dickifier.Services;
 
 public interface IJwtService
 {
-    string GenerateToken(User user);
+    string GenerateToken(User user, Guid familyId);
 }
 
-public class JwtService : IJwtService
+public sealed class JwtService(JwtOptions settings) : IJwtService
 {
-    private readonly IConfiguration _configuration;
-
-    public JwtService(IConfiguration configuration)
+    public string GenerateToken(User user, Guid familyId)
     {
-        _configuration = configuration;
-    }
-
-    public string GenerateToken(User user)
-    {
-        var secretKey = _configuration["Jwt:SecretKey"]
-            ?? throw new InvalidOperationException("Jwt:SecretKey no está configurado.");
-        var issuer = _configuration["Jwt:Issuer"] ?? "PhalloLab.DickifierApi";
-        var audience = _configuration["Jwt:Audience"] ?? "PhalloLab.DickifierClient";
-        var expireMinutes = double.TryParse(_configuration["Jwt:ExpireMinutes"], out var exp) ? exp : 10080; // 7 días
-
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
-        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
-        var claims = new List<Claim>
+        var descriptor = new SecurityTokenDescriptor
         {
-            new(ClaimTypes.NameIdentifier, user.Id.ToString()),
-            new(ClaimTypes.Name, user.Username),
-            new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            Subject = new ClaimsIdentity([
+                new(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new(ClaimTypes.Name, user.Username),
+                new("sid", familyId.ToString()),
+                new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            ]),
+            Expires = DateTime.UtcNow.AddMinutes(settings.AccessMinutes),
+            Issuer = settings.Issuer, Audience = settings.Audience,
+            SigningCredentials = new(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.SecretKey)), SecurityAlgorithms.HmacSha256),
         };
-
-        if (!string.IsNullOrWhiteSpace(user.Email))
-        {
-            claims.Add(new(ClaimTypes.Email, user.Email));
-        }
-
-        var tokenDescriptor = new SecurityTokenDescriptor
-        {
-            Subject = new ClaimsIdentity(claims),
-            Expires = DateTime.UtcNow.AddMinutes(expireMinutes),
-            Issuer = issuer,
-            Audience = audience,
-            SigningCredentials = credentials
-        };
-
-        var tokenHandler = new JwtSecurityTokenHandler();
-        var token = tokenHandler.CreateToken(tokenDescriptor);
-        return tokenHandler.WriteToken(token);
+        var handler = new JwtSecurityTokenHandler();
+        return handler.WriteToken(handler.CreateToken(descriptor));
     }
 }

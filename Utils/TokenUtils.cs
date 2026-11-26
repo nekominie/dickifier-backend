@@ -12,14 +12,12 @@ public static class TokenUtils
     /// </summary>
     public static string GenerateSecureToken(int length = 32)
     {
-        var bytes = new byte[length];
-        RandomNumberGenerator.Fill(bytes);
-        var sb = new StringBuilder(length);
-        foreach (var b in bytes)
-        {
-            sb.Append(TokenChars[b % TokenChars.Length]);
-        }
-        return sb.ToString();
+        return RandomNumberGenerator.GetString(TokenChars,length);
+    }
+    public static bool Matches(string? token, string? expected)
+    {
+        if (token is null || token.Length is < 24 or > 128 || expected?.Length != 64) return false;
+        return CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(ComputeSha256Hash(token)),Encoding.ASCII.GetBytes(expected.ToLowerInvariant()));
     }
 
     /// <summary>

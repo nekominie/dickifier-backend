@@ -11,7 +11,8 @@ public record RegisterRequest(
     string Username,
 
     [Required]
-    [MinLength(6, ErrorMessage = "La contraseña debe tener al menos 6 caracteres.")]
+    [MinLength(12, ErrorMessage = "La contraseña debe tener al menos 12 caracteres.")]
+    [MaxLength(128)]
     string Password,
 
     [EmailAddress(ErrorMessage = "Formato de correo electrónico inválido.")]
@@ -20,8 +21,8 @@ public record RegisterRequest(
 );
 
 public record LoginRequest(
-    [Required] string Username,
-    [Required] string Password
+    [Required, MaxLength(50)] string Username,
+    [Required, MaxLength(128)] string Password
 );
 
 public record UserPublicDto(
@@ -33,7 +34,8 @@ public record UserPublicDto(
 
 public record AuthResponse(
     string Token,
-    UserPublicDto User
+    UserPublicDto User,
+    DateTime ExpiresAt
 );
 
 public record SaveWorkspaceDraftRequest(

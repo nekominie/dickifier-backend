@@ -12,6 +12,8 @@ public class DickifierDbContext : DbContext
     public DbSet<User> Users => Set<User>();
     public DbSet<DickModel> Models => Set<DickModel>();
     public DbSet<ModelVote> ModelVotes => Set<ModelVote>();
+    public DbSet<RefreshSession> RefreshSessions => Set<RefreshSession>();
+    public DbSet<ResourceBudget> ResourceBudgets => Set<ResourceBudget>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -22,7 +24,17 @@ public class DickifierDbContext : DbContext
         {
             entity.HasIndex(u => u.Username)
                 .IsUnique();
+            entity.HasIndex(u => u.NormalizedUsername).IsUnique();
         });
+
+        modelBuilder.Entity<RefreshSession>(entity =>
+        {
+            entity.HasIndex(s => s.TokenHash).IsUnique();
+            entity.HasIndex(s => new { s.FamilyId, s.UserId });
+            entity.HasIndex(s => s.ExpiresAt);
+            entity.HasOne(s => s.User).WithMany().HasForeignKey(s => s.UserId).OnDelete(DeleteBehavior.Cascade);
+        });
+        modelBuilder.Entity<ResourceBudget>().HasIndex(b => b.ExpiresAt);
 
         // Tabla DickModels
         modelBuilder.Entity<DickModel>(entity =>
